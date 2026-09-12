@@ -8,8 +8,6 @@ from airflow.models import Variable
 
 from scripts.db_utils import validate_source_data, extract_snapshot_to_s3
 
-from scripts.s3_utils import save_predictions_to_s3
-
 from scripts.s3_utils import check_model_exists
 
 from scripts.inference import run_inference
@@ -153,21 +151,7 @@ with DAG(
         )
 
     # ─────────────────────────────────────────────────────────
-    # Сохранение результата
-    # ─────────────────────────────────────────────────────────
-
-    save_predictions_to_s3_task = PythonOperator(
-        task_id="save_predictions_to_s3",
-        python_callable=save_predictions_to_s3,
-        op_kwargs={
-            "s3_bucket": S3_BUCKET,
-            "s3_conn_id": S3_CONN_ID,
-            "output_prefix": S3_OUTPUT_PREFIX,
-        },
-    )
-
-    # ─────────────────────────────────────────────────────────
     # Порядок выполнения
     # ─────────────────────────────────────────────────────────
 
-    check_model >> load_data >> inference >> save_predictions_to_s3_task
+    check_model >> load_data >> inference
