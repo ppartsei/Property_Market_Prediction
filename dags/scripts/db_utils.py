@@ -321,9 +321,11 @@ logger = logging.getLogger(__name__)
 def save_predictions_to_db(pg_conn_id, target_table, **context):
     ti = context["ti"]
 
-    output_s3_key = ti.xcom_pull(task_ids="run_inference", key="output_s3_key")
-    s3_bucket = ti.xcom_pull(task_ids="run_inference", key="s3_bucket")
-    s3_conn_id = ti.xcom_pull(task_ids="run_inference", key="s3_conn_id")
+    output_s3_key = ti.xcom_pull(
+        task_ids="inference.run_inference", key="output_s3_key"
+    )
+    s3_bucket = ti.xcom_pull(task_ids="inference.run_inference", key="s3_bucket")
+    s3_conn_id = ti.xcom_pull(task_ids="inference.run_inference", key="s3_conn_id")
 
     if not output_s3_key:
         raise ValueError("Не получен путь к файлу предсказаний из XCom")
