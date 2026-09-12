@@ -6,7 +6,11 @@ from airflow.utils.task_group import TaskGroup
 from airflow.models import Variable
 
 
-from scripts.db_utils import validate_source_data, extract_snapshot_to_s3
+from scripts.db_utils import (
+    validate_source_data,
+    extract_snapshot_to_s3,
+    save_predictions_to_db,
+)
 
 from scripts.s3_utils import check_model_exists
 
@@ -18,7 +22,7 @@ from scripts.inference import run_inference
 
 TARGET_TABLE = Variable.get(
     "smartscore_target_table",
-    default_var="final_project.SmartScore_predict",
+    default_var="public.SmartScore_predict",
 )
 
 S3_BUCKET = Variable.get(
@@ -150,8 +154,22 @@ with DAG(
             },
         )
 
+    with TaskGroup(
+        group_id="save_results",
+        tooltip="Сохранение предсказаний в PostgreSQL",
+    ) as save_results:
+
+        save_predictions = PythonOperator(
+            task_id="save_predictions",
+            python_callable=save_predictions_to_db,
+            op_kwargs={
+                "pg_conn_id": PG_CONN_ID,
+                "target_table": TARGET_TABLE,
+            },
+        )
+
     # ─────────────────────────────────────────────────────────
     # Порядок выполнения
     # ─────────────────────────────────────────────────────────
 
-    check_model >> load_data >> inference
+    check_model >> load_data >> inference >> save_results

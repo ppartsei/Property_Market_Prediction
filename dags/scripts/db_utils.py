@@ -3,6 +3,8 @@ import logging
 import pandas as pd
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
+from scripts.s3_utils import download_json
+
 from scripts.s3_utils import upload_json
 
 logger = logging.getLogger(__name__)
@@ -308,6 +310,86 @@ def save_predictions_to_db(
         conn.rollback()
         raise
 
+    finally:
+        cursor.close()
+        conn.close()
+
+
+logger = logging.getLogger(__name__)
+
+
+def save_predictions_to_db(pg_conn_id, target_table, **context):
+    ti = context["ti"]
+
+    output_s3_key = ti.xcom_pull(task_ids="run_inference", key="output_s3_key")
+    s3_bucket = ti.xcom_pull(task_ids="run_inference", key="s3_bucket")
+    s3_conn_id = ti.xcom_pull(task_ids="run_inference", key="s3_conn_id")
+
+    if not output_s3_key:
+        raise ValueError("Не получен путь к файлу предсказаний из XCom")
+
+    predictions = download_json(s3_bucket, output_s3_key, s3_conn_id)
+    logger.info("Скачано %d предсказаний из S3: %s", len(predictions), output_s3_key)
+
+    inference_date = None
+    for row in predictions:
+        if row.get("inference_date"):
+            inference_date = row["inference_date"]
+            break
+
+    if not inference_date:
+        raise ValueError("Не удалось определить inference_date из предсказаний")
+
+    logger.info("Дата инференса: %s", inference_date)
+
+    hook = PostgresHook(postgres_conn_id=pg_conn_id)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "SELECT COUNT(*) FROM {table} WHERE inference_date = %s".format(
+                table=target_table
+            ),
+            (inference_date,),
+        )
+        count = cursor.fetchone()[0]
+        logger.info(
+            "Найдено %d записей за дату %s в таблице %s",
+            count,
+            inference_date,
+            target_table,
+        )
+
+        if count > 0:
+            logger.info(
+                "Данные за %s уже существуют — пропускаем загрузку", inference_date
+            )
+            return
+
+        values = [(row["id"], row["score"], inference_date) for row in predictions]
+
+        batch_size = 1000
+        inserted = 0
+        for i in range(0, len(values), batch_size):
+            batch = values[i : i + batch_size]
+            cursor.executemany(
+                "INSERT INTO {table} (id, score, inference_date) VALUES (%s, %s, %s)".format(
+                    table=target_table
+                ),
+                batch,
+            )
+            inserted += len(batch)
+            logger.info("Вставлено %d / %d строк", inserted, len(values))
+
+        conn.commit()
+        logger.info(
+            "Готово. Всего вставлено %d строк за дату %s", inserted, inference_date
+        )
+
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         cursor.close()
         conn.close()
