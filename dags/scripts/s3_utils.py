@@ -3,6 +3,11 @@ import json
 import logging
 import pickle
 
+import os
+import tempfile
+import csv
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
 import boto3
 
 from airflow.hooks.base import BaseHook
@@ -147,3 +152,34 @@ def download_json(
     body = response["Body"].read()
 
     return json.loads(body.decode("utf-8"))
+
+
+def save_predictions_to_s3(s3_bucket, s3_conn_id, output_prefix, **context):
+    ti = context["ti"]
+    # Получаем предсказания из предыдущей задачи (run_inference)
+    predictions = ti.xcom_pull(task_ids="run_inference")
+
+    if not predictions:
+        raise ValueError("Нет данных для сохранения: predictions пуст")
+
+    ds_nodash = context["ds_nodash"]  # дата запуска без дефисов, например 20260912
+    key = f"{output_prefix}/inference_date={ds_nodash}/predictions_{ds_nodash}.csv"
+
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".csv") as tmp_file:
+        tmp_path = tmp_file.name
+        if predictions:
+            fieldnames = predictions.keys()
+            writer = csv.DictWriter(tmp_file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(predictions)
+
+    s3_hook = S3Hook(aws_conn_id=s3_conn_id)
+    s3_hook.load_file(
+        filename=tmp_path,
+        key=key,
+        bucket_name=s3_bucket,
+        replace=True,
+    )
+
+    os.unlink(tmp_path)
+    return key  # можно вернуть путь в S3 через XCom для следующих задач

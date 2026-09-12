@@ -6,12 +6,9 @@ from airflow.utils.task_group import TaskGroup
 from airflow.models import Variable
 
 
-from scripts.db_utils import (
-    create_target_table,
-    validate_source_data,
-    extract_snapshot_to_s3,
-    save_predictions_to_db,
-)
+from scripts.db_utils import validate_source_data, extract_snapshot_to_s3
+
+from scripts.s3_utils import save_predictions_to_s3
 
 from scripts.s3_utils import check_model_exists
 
@@ -20,11 +17,6 @@ from scripts.inference import run_inference
 # ─────────────────────────────────────────────────────────────
 # Настройки из Airflow Variables
 # ─────────────────────────────────────────────────────────────
-
-SOURCE_TABLE = Variable.get(
-    "smartscore_source_table",
-    default_var="final_project.smartscore_test_snapshot",
-)
 
 TARGET_TABLE = Variable.get(
     "smartscore_target_table",
@@ -57,16 +49,20 @@ THRESHOLD = float(
     )
 )
 
-PG_CONN_ID = Variable.get(
-    "smartscore_pg_conn_id",
-    default_var="postgres_smartscore",
-)
-
 S3_CONN_ID = Variable.get(
     "smartscore_s3_conn_id",
     default_var="yandex_s3",
 )
 
+SOURCE_TABLE = Variable.get(
+    "smartscore_source_table",
+    default_var="final_project.smartscore_test_snapshot",
+)
+
+PG_CONN_ID = Variable.get(
+    "smartscore_pg_conn_id",
+    default_var="postgres_smartscore",
+)
 
 # ─────────────────────────────────────────────────────────────
 # DAG
@@ -109,24 +105,14 @@ with DAG(
     # ─────────────────────────────────────────────────────────
 
     with TaskGroup(
-        group_id="load_data",
-        tooltip="Проверка и загрузка snapshot",
+        group_id="load_data", tooltip="Проверка и загрузка snapshot"
     ) as load_data:
-
-        create_table = PythonOperator(
-            task_id="create_target_table",
-            python_callable=create_target_table,
-            op_kwargs={
-                "pg_conn_id": PG_CONN_ID,
-                "target_table": TARGET_TABLE,
-            },
-        )
 
         validate_data = PythonOperator(
             task_id="validate_source_data",
             python_callable=validate_source_data,
             op_kwargs={
-                "pg_conn_id": PG_CONN_ID,
+                "pg_conn_id": PG_CONN_ID,  # <-- пока оставляем, если валидация идёт по БД
                 "source_table": SOURCE_TABLE,
             },
         )
@@ -135,7 +121,7 @@ with DAG(
             task_id="extract_snapshot_to_s3",
             python_callable=extract_snapshot_to_s3,
             op_kwargs={
-                "pg_conn_id": PG_CONN_ID,
+                "pg_conn_id": PG_CONN_ID,  # <-- пока оставляем, если выгрузка из БД
                 "source_table": SOURCE_TABLE,
                 "s3_bucket": S3_BUCKET,
                 "s3_prefix": S3_INPUT_PREFIX,
@@ -143,7 +129,7 @@ with DAG(
             },
         )
 
-        create_table >> validate_data >> extract_data
+        validate_data >> extract_data
 
     # ─────────────────────────────────────────────────────────
     # Инференс
@@ -170,22 +156,18 @@ with DAG(
     # Сохранение результата
     # ─────────────────────────────────────────────────────────
 
-    with TaskGroup(
-        group_id="save_results",
-        tooltip="Сохранение предсказаний в PostgreSQL",
-    ) as save_results:
-
-        save_predictions = PythonOperator(
-            task_id="save_predictions",
-            python_callable=save_predictions_to_db,
-            op_kwargs={
-                "pg_conn_id": PG_CONN_ID,
-                "target_table": TARGET_TABLE,
-            },
-        )
+    save_predictions_to_s3_task = PythonOperator(
+        task_id="save_predictions_to_s3",
+        python_callable=save_predictions_to_s3,
+        op_kwargs={
+            "s3_bucket": S3_BUCKET,
+            "s3_conn_id": S3_CONN_ID,
+            "output_prefix": S3_OUTPUT_PREFIX,
+        },
+    )
 
     # ─────────────────────────────────────────────────────────
     # Порядок выполнения
     # ─────────────────────────────────────────────────────────
 
-    check_model >> load_data >> inference >> save_results
+    check_model >> load_data >> inference >> save_predictions_to_s3_task
