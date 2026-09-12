@@ -333,14 +333,13 @@ def save_predictions_to_db(pg_conn_id, target_table, **context):
     predictions = download_json(s3_bucket, output_s3_key, s3_conn_id)
     logger.info("Скачано %d предсказаний из S3: %s", len(predictions), output_s3_key)
 
-    inference_date = None
-    for row in predictions:
-        if row.get("inference_date"):
-            inference_date = row["inference_date"]
-            break
+    inference_date = ti.xcom_pull(
+        task_ids="load_data.validate_source_data",
+        key="inference_date",
+    )
 
     if not inference_date:
-        raise ValueError("Не удалось определить inference_date из предсказаний")
+        raise ValueError("Не получена inference_date из XCom")
 
     logger.info("Дата инференса: %s", inference_date)
 
