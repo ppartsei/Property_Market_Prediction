@@ -118,10 +118,7 @@ def upload_json(
 
     s3_client = get_s3_client(s3_conn_id)
 
-    body = json.dumps(
-        data,
-        ensure_ascii=False,
-    ).encode("utf-8")
+    body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
 
     s3_client.put_object(
         Bucket=bucket,
