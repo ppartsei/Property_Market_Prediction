@@ -1,37 +1,62 @@
+# dags/smart_score_batch_inference.py
+
 from datetime import datetime, timedelta
 
 from airflow import DAG
+from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
-from airflow.models import Variable
-
 
 from scripts.db_utils import (
-    validate_source_data,
+    create_target_table,
     extract_snapshot_to_s3,
     save_predictions_to_db,
+    validate_source_data,
 )
 
 from scripts.s3_utils import check_model_exists
 
 from scripts.inference import run_inference
 
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Настройки из Airflow Variables
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+# PostgreSQL
+PG_CONN_ID = Variable.get(
+    "smartscore_pg_conn_id",
+    default_var="postgres_smartscore",
+)
+
+SOURCE_TABLE = Variable.get(
+    "smartscore_source_table",
+    default_var="final_project.SmartScore_test_snapshot",
+)
 
 TARGET_TABLE = Variable.get(
     "smartscore_target_table",
-    default_var="public.SmartScore_predict",
+    default_var="final_project.SmartScore_predict",
+)
+
+# S3
+S3_CONN_ID = Variable.get(
+    "smartscore_s3_conn_id",
+    default_var="yandex_s3",
 )
 
 S3_BUCKET = Variable.get(
     "smartscore_s3_bucket",
+    default_var=None,  # обязательна
 )
 
 S3_MODEL_KEY = Variable.get(
     "smartscore_model_key",
     default_var="catboost_model.pkl",
+)
+
+S3_STATS_KEY = Variable.get(
+    "smartscore_stats_key",
+    default_var="smartscore/artifacts/preprocess_stats.pkl",
 )
 
 S3_INPUT_PREFIX = Variable.get(
@@ -44,31 +69,18 @@ S3_OUTPUT_PREFIX = Variable.get(
     default_var="smartscore/output",
 )
 
+# Порог бинаризации
 THRESHOLD = float(
     Variable.get(
         "smartscore_threshold",
-        default_var="0.56",
+        default_var="0.55",
     )
 )
 
-S3_CONN_ID = Variable.get(
-    "smartscore_s3_conn_id",
-    default_var="yandex_s3",
-)
 
-SOURCE_TABLE = Variable.get(
-    "smartscore_source_table",
-    default_var="final_project.smartscore_test_snapshot",
-)
-
-PG_CONN_ID = Variable.get(
-    "smartscore_pg_conn_id",
-    default_var="postgres_smartscore",
-)
-
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # DAG
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 default_args = {
     "owner": "data_team",
@@ -88,9 +100,9 @@ with DAG(
     description="Батч-инференс SmartScore для фиксированного snapshot",
 ) as dag:
 
-    # ─────────────────────────────────────────────────────────
-    # Проверка модели
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # 1. Проверка модели в S3
+    # ─────────────────────────────────────────────────────────────────────
 
     check_model = PythonOperator(
         task_id="check_model",
@@ -102,19 +114,20 @@ with DAG(
         },
     )
 
-    # ─────────────────────────────────────────────────────────
-    # Подготовка БД
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # 2. Загрузка данных: проверка snapshot + выгрузка в S3
+    # ─────────────────────────────────────────────────────────────────────
 
     with TaskGroup(
-        group_id="load_data", tooltip="Проверка и загрузка snapshot"
+        group_id="load_data",
+        tooltip="Проверка snapshot и выгрузка в S3",
     ) as load_data:
 
         validate_data = PythonOperator(
             task_id="validate_source_data",
             python_callable=validate_source_data,
             op_kwargs={
-                "pg_conn_id": PG_CONN_ID,  # <-- пока оставляем, если валидация идёт по БД
+                "pg_conn_id": PG_CONN_ID,
                 "source_table": SOURCE_TABLE,
             },
         )
@@ -123,7 +136,7 @@ with DAG(
             task_id="extract_snapshot_to_s3",
             python_callable=extract_snapshot_to_s3,
             op_kwargs={
-                "pg_conn_id": PG_CONN_ID,  # <-- пока оставляем, если выгрузка из БД
+                "pg_conn_id": PG_CONN_ID,
                 "source_table": SOURCE_TABLE,
                 "s3_bucket": S3_BUCKET,
                 "s3_prefix": S3_INPUT_PREFIX,
@@ -133,9 +146,9 @@ with DAG(
 
         validate_data >> extract_data
 
-    # ─────────────────────────────────────────────────────────
-    # Инференс
-    # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # 3. Инференс
+    # ─────────────────────────────────────────────────────────────────────
 
     with TaskGroup(
         group_id="inference",
@@ -148,16 +161,30 @@ with DAG(
             op_kwargs={
                 "s3_bucket": S3_BUCKET,
                 "model_key": S3_MODEL_KEY,
+                "stats_key": S3_STATS_KEY,
                 "output_prefix": S3_OUTPUT_PREFIX,
                 "threshold": THRESHOLD,
                 "s3_conn_id": S3_CONN_ID,
             },
         )
 
+    # ─────────────────────────────────────────────────────────────────────
+    # 4. Сохранение результатов
+    # ─────────────────────────────────────────────────────────────────────
+
     with TaskGroup(
         group_id="save_results",
-        tooltip="Сохранение предсказаний в PostgreSQL",
+        tooltip="Создание витрины и сохранение предсказаний",
     ) as save_results:
+
+        ensure_table = PythonOperator(
+            task_id="create_target_table",
+            python_callable=create_target_table,
+            op_kwargs={
+                "pg_conn_id": PG_CONN_ID,
+                "target_table": TARGET_TABLE,
+            },
+        )
 
         save_predictions = PythonOperator(
             task_id="save_predictions",
@@ -168,8 +195,10 @@ with DAG(
             },
         )
 
-    # ─────────────────────────────────────────────────────────
-    # Порядок выполнения
-    # ─────────────────────────────────────────────────────────
+        ensure_table >> save_predictions
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 5. Порядок выполнения
+    # ─────────────────────────────────────────────────────────────────────
 
     check_model >> load_data >> inference >> save_results

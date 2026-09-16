@@ -1,17 +1,19 @@
-import logging
+# scripts/db_utils.py
 
-import pandas as pd
+import logging
+import re
+
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 from scripts.s3_utils import download_json
 
-from scripts.s3_utils import upload_json
-
 logger = logging.getLogger(__name__)
 
 
-# Обязательные колонки snapshot,
-# необходимые для preprocessing и inference.
+# ─────────────────────────────────────────────────────────────────────────────
+# Обязательные колонки snapshot
+# ─────────────────────────────────────────────────────────────────────────────
+
 REQUIRED_COLUMNS = [
     "id",
     "name",
@@ -40,6 +42,28 @@ REQUIRED_COLUMNS = [
 ]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Вспомогательные проверки
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _validate_table_name(table_name: str) -> None:
+    """
+    Проверяет, что имя таблицы имеет вид schema.table
+    и не содержит подозрительных символов.
+    """
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*", table_name):
+        raise ValueError(
+            f"Невалидное имя таблицы: {table_name!r}. "
+            "Ожидается формат 'schema.table'."
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Создание витрины
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def create_target_table(
     pg_conn_id: str,
     target_table: str,
@@ -48,24 +72,26 @@ def create_target_table(
     """
     Создаёт витрину, если она ещё не существует.
     """
+    _validate_table_name(target_table)
 
     hook = PostgresHook(postgres_conn_id=pg_conn_id)
 
-    schema, table = target_table.split(".", 1)
-
     query = f"""
-        CREATE TABLE IF NOT EXISTS {schema}.{table} (
+        CREATE TABLE IF NOT EXISTS {target_table} (
             id BIGINT NOT NULL,
             score INTEGER NOT NULL,
             inference_date DATE NOT NULL
         )
     """
 
-    logger.info(f"Проверяем наличие таблицы {target_table}")
-
+    logger.info("Проверяем наличие таблицы %s", target_table)
     hook.run(query)
+    logger.info("Таблица %s готова к работе.", target_table)
 
-    logger.info(f"Таблица {target_table} готова к работе.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Проверка snapshot в БД
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def validate_source_data(
@@ -75,47 +101,39 @@ def validate_source_data(
 ):
     """
     Проверяет:
-    - что snapshot не пустой;
-    - что snapshot_date существует;
-    - что обязательные колонки присутствуют;
-    - что максимальная дата определена.
+      - что snapshot содержит все обязательные колонки;
+      - что snapshot не пуст;
+      - что MAX(snapshot_date) определён.
+
+    Через XCom передаёт inference_date (строкой).
     """
+    _validate_table_name(source_table)
 
     hook = PostgresHook(postgres_conn_id=pg_conn_id)
 
-    columns_query = f"""
-        SELECT *
-        FROM {source_table}
-        LIMIT 0
-    """
-
+    # 1. Проверка колонок
+    columns_query = f"SELECT * FROM {source_table} LIMIT 0"
     df_columns = hook.get_pandas_df(columns_query)
 
-    missing_columns = [
-        column for column in REQUIRED_COLUMNS if column not in df_columns.columns
-    ]
+    missing_columns = [col for col in REQUIRED_COLUMNS if col not in df_columns.columns]
 
     if missing_columns:
         raise ValueError(
-            f"В {source_table} отсутствуют " f"обязательные колонки: {missing_columns}"
+            f"В {source_table} отсутствуют обязательные колонки: {missing_columns}"
         )
 
-    count_query = f"""
-        SELECT COUNT(*)
+    # 2. Проверка на пустоту + получение max(snapshot_date) одним запросом
+    stats_query = f"""
+        SELECT
+            COUNT(*)             AS row_count,
+            MAX(snapshot_date)   AS max_date
         FROM {source_table}
     """
 
-    count = hook.get_first(count_query)[0]
+    row_count, inference_date = hook.get_first(stats_query)
 
-    if count == 0:
+    if row_count == 0:
         raise ValueError(f"Таблица {source_table} пуста.")
-
-    max_date_query = f"""
-        SELECT MAX(snapshot_date)
-        FROM {source_table}
-    """
-
-    inference_date = hook.get_first(max_date_query)[0]
 
     if inference_date is None:
         raise ValueError(
@@ -129,8 +147,15 @@ def validate_source_data(
     )
 
     logger.info(
-        f"Источник проверен. " f"Строк: {count}. " f"Дата инференса: {inference_date}"
+        "Источник проверен. Строк: %d. Дата инференса: %s",
+        row_count,
+        inference_date,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Выгрузка snapshot в S3
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def extract_snapshot_to_s3(
@@ -142,11 +167,11 @@ def extract_snapshot_to_s3(
     **context,
 ):
     """
-    Загружает только последний snapshot в S3.
+    Загружает в S3 только последний snapshot (за inference_date).
 
-    Через XCom передаётся только ключ S3,
-    сами данные через XCom не передаются.
+    Через XCom передаётся только ключ S3.
     """
+    _validate_table_name(source_table)
 
     ti = context["ti"]
 
@@ -156,7 +181,7 @@ def extract_snapshot_to_s3(
     )
 
     if not inference_date:
-        raise ValueError("Не найдена дата инференса.")
+        raise ValueError("Не найдена дата инференса (inference_date).")
 
     hook = PostgresHook(postgres_conn_id=pg_conn_id)
 
@@ -166,17 +191,18 @@ def extract_snapshot_to_s3(
         WHERE snapshot_date = %s
     """
 
-    df = hook.get_pandas_df(
-        query,
-        parameters=(inference_date,),
-    )
+    df = hook.get_pandas_df(query, parameters=(inference_date,))
 
     if df.empty:
         raise ValueError(f"Snapshot за дату {inference_date} пуст.")
 
-    logger.info(f"Загружено {len(df)} строк " f"за дату {inference_date}.")
+    logger.info("Загружено %d строк за дату %s.", len(df), inference_date)
 
-    key = f"{s3_prefix}/" f"snapshot_{inference_date}.json"
+    key = f"{s3_prefix}/snapshot_{inference_date}.json"
+
+    # upload_json тянем здесь, чтобы не импортировать на уровне модуля
+    # (избегаем циклического импорта при возможных будущих правках)
+    from scripts.s3_utils import upload_json
 
     upload_json(
         df.to_dict(orient="records"),
@@ -185,12 +211,14 @@ def extract_snapshot_to_s3(
         s3_conn_id=s3_conn_id,
     )
 
-    ti.xcom_push(
-        key="input_s3_key",
-        value=key,
-    )
+    ti.xcom_push(key="input_s3_key", value=key)
 
-    logger.info(f"Snapshot сохранён в " f"s3://{s3_bucket}/{key}")
+    logger.info("Snapshot сохранён в s3://%s/%s", s3_bucket, key)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Запись предсказаний в витрину
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def save_predictions_to_db(
@@ -201,9 +229,11 @@ def save_predictions_to_db(
     """
     Загружает результаты в витрину.
 
-    Если inference_date уже существует,
-    загрузка полностью пропускается.
+    Идемпотентность:
+      если в target_table уже есть строки за inference_date —
+      загрузка полностью пропускается.
     """
+    _validate_table_name(target_table)
 
     ti = context["ti"]
 
@@ -211,33 +241,29 @@ def save_predictions_to_db(
         task_ids="inference.run_inference",
         key="output_s3_key",
     )
-
+    s3_bucket = ti.xcom_pull(
+        task_ids="inference.run_inference",
+        key="s3_bucket",
+    )
+    s3_conn_id = ti.xcom_pull(
+        task_ids="inference.run_inference",
+        key="s3_conn_id",
+    )
     inference_date = ti.xcom_pull(
         task_ids="load_data.validate_source_data",
         key="inference_date",
     )
 
     if not output_s3_key:
-        raise ValueError("Не найден S3-файл с результатами.")
-
-    if not inference_date:
-        raise ValueError("Не найдена дата инференса.")
-
-    from scripts.s3_utils import download_json
-
-    s3_bucket = ti.xcom_pull(
-        task_ids="inference.run_inference",
-        key="s3_bucket",
-    )
-
-    s3_conn_id = ti.xcom_pull(
-        task_ids="inference.run_inference",
-        key="s3_conn_id",
-    )
+        raise ValueError("Не найден S3-файл с результатами (output_s3_key).")
 
     if not s3_bucket or not s3_conn_id:
-        raise ValueError("Не найдены параметры S3.")
+        raise ValueError("Не найдены параметры S3 (s3_bucket / s3_conn_id).")
 
+    if not inference_date:
+        raise ValueError("Не найдена дата инференса (inference_date).")
+
+    # 1. Скачиваем предсказания
     predictions = download_json(
         bucket=s3_bucket,
         key=output_s3_key,
@@ -245,152 +271,72 @@ def save_predictions_to_db(
     )
 
     if not predictions:
-        raise ValueError("Файл с предсказаниями пуст.")
+        raise ValueError(
+            f"Файл с предсказаниями пуст: s3://{s3_bucket}/{output_s3_key}"
+        )
 
+    logger.info(
+        "Скачано %d предсказаний из s3://%s/%s",
+        len(predictions),
+        s3_bucket,
+        output_s3_key,
+    )
+
+    # 2. Подключение к БД
     hook = PostgresHook(postgres_conn_id=pg_conn_id)
-
     conn = hook.get_conn()
+    cursor = None
 
     try:
         cursor = conn.cursor()
 
-        # Проверяем наличие результатов за дату.
-        check_query = f"""
-            SELECT EXISTS (
-                SELECT 1
-                FROM {target_table}
-                WHERE inference_date = %s
-            )
-        """
-
+        # 3. Проверка идемпотентности
         cursor.execute(
-            check_query,
+            f"SELECT EXISTS ("
+            f"  SELECT 1 FROM {target_table} WHERE inference_date = %s"
+            f")",
             (inference_date,),
         )
-
         already_exists = cursor.fetchone()[0]
 
         if already_exists:
             logger.warning(
-                f"Результаты за дату "
-                f"{inference_date} уже существуют. "
-                "Загрузка пропущена."
+                "Результаты за дату %s уже есть в %s. Загрузка пропущена.",
+                inference_date,
+                target_table,
             )
             return
 
-        insert_query = f"""
-            INSERT INTO {target_table}
-                (id, score, inference_date)
-            VALUES (%s, %s, %s)
-        """
-
+        # 4. Подготовка батча
         rows = [
-            (
-                int(row["id"]),
-                int(row["score"]),
-                inference_date,
-            )
-            for row in predictions
+            (int(row["id"]), int(row["score"]), inference_date) for row in predictions
         ]
 
-        cursor.executemany(
-            insert_query,
+        # 5. Вставка батчами через execute_values
+        from psycopg2.extras import execute_values
+
+        execute_values(
+            cursor,
+            f"INSERT INTO {target_table} (id, score, inference_date) VALUES %s",
             rows,
+            page_size=1000,
         )
 
         conn.commit()
 
         logger.info(
-            f"В {target_table} добавлено "
-            f"{len(rows)} строк. "
-            f"Дата инференса: {inference_date}"
-        )
-
-    except Exception:
-        conn.rollback()
-        raise
-
-    finally:
-        cursor.close()
-        conn.close()
-
-
-logger = logging.getLogger(__name__)
-
-
-def save_predictions_to_db(pg_conn_id, target_table, **context):
-    ti = context["ti"]
-
-    output_s3_key = ti.xcom_pull(
-        task_ids="inference.run_inference", key="output_s3_key"
-    )
-    s3_bucket = ti.xcom_pull(task_ids="inference.run_inference", key="s3_bucket")
-    s3_conn_id = ti.xcom_pull(task_ids="inference.run_inference", key="s3_conn_id")
-
-    if not output_s3_key:
-        raise ValueError("Не получен путь к файлу предсказаний из XCom")
-
-    predictions = download_json(s3_bucket, output_s3_key, s3_conn_id)
-    logger.info("Скачано %d предсказаний из S3: %s", len(predictions), output_s3_key)
-
-    inference_date = ti.xcom_pull(
-        task_ids="load_data.validate_source_data",
-        key="inference_date",
-    )
-
-    if not inference_date:
-        raise ValueError("Не получена inference_date из XCom")
-
-    logger.info("Дата инференса: %s", inference_date)
-
-    hook = PostgresHook(postgres_conn_id=pg_conn_id)
-    conn = hook.get_conn()
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute(
-            "SELECT COUNT(*) FROM {table} WHERE inference_date = %s".format(
-                table=target_table
-            ),
-            (inference_date,),
-        )
-        count = cursor.fetchone()[0]
-        logger.info(
-            "Найдено %d записей за дату %s в таблице %s",
-            count,
-            inference_date,
+            "В %s добавлено %d строк за дату %s.",
             target_table,
-        )
-
-        if count > 0:
-            logger.info(
-                "Данные за %s уже существуют — пропускаем загрузку", inference_date
-            )
-            return
-
-        values = [(row["id"], row["score"], inference_date) for row in predictions]
-
-        batch_size = 1000
-        inserted = 0
-        for i in range(0, len(values), batch_size):
-            batch = values[i : i + batch_size]
-            cursor.executemany(
-                "INSERT INTO {table} (id, score, inference_date) VALUES (%s, %s, %s)".format(
-                    table=target_table
-                ),
-                batch,
-            )
-            inserted += len(batch)
-            logger.info("Вставлено %d / %d строк", inserted, len(values))
-
-        conn.commit()
-        logger.info(
-            "Готово. Всего вставлено %d строк за дату %s", inserted, inference_date
+            len(rows),
+            inference_date,
         )
 
     except Exception:
         conn.rollback()
+        logger.exception("Ошибка при записи предсказаний в %s", target_table)
         raise
+
     finally:
-        cursor.close()
+        if cursor is not None:
+            cursor.close()
         conn.close()

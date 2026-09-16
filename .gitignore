@@ -2,3 +2,4 @@
 .ipynb_checkpoints/
 *.csv
 catboost_info/
+.joblib
