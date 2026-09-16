@@ -34,7 +34,7 @@ SOURCE_TABLE = Variable.get(
 
 TARGET_TABLE = Variable.get(
     "smartscore_target_table",
-    default_var="final_project.SmartScore_predict",
+    default_var="public.SmartScore_predict",
 )
 
 # S3
