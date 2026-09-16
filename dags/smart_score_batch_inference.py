@@ -8,7 +8,6 @@ from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
 
 from scripts.db_utils import (
-    create_target_table,
     extract_snapshot_to_s3,
     save_predictions_to_db,
     validate_source_data,
@@ -173,18 +172,8 @@ with DAG(
     # ─────────────────────────────────────────────────────────────────────
 
     with TaskGroup(
-        group_id="save_results",
-        tooltip="Создание витрины и сохранение предсказаний",
+        group_id="save_results", tooltip="Сохранение предсказаний в PostgreSQL"
     ) as save_results:
-
-        ensure_table = PythonOperator(
-            task_id="create_target_table",
-            python_callable=create_target_table,
-            op_kwargs={
-                "pg_conn_id": PG_CONN_ID,
-                "target_table": TARGET_TABLE,
-            },
-        )
 
         save_predictions = PythonOperator(
             task_id="save_predictions",
@@ -194,8 +183,6 @@ with DAG(
                 "target_table": TARGET_TABLE,
             },
         )
-
-        ensure_table >> save_predictions
 
     # ─────────────────────────────────────────────────────────────────────
     # 5. Порядок выполнения

@@ -48,45 +48,12 @@ REQUIRED_COLUMNS = [
 
 
 def _validate_table_name(table_name: str) -> None:
-    """
-    Проверяет, что имя таблицы имеет вид schema.table
-    и не содержит подозрительных символов.
-    """
+    """Проверяет, что имя таблицы имеет вид schema.table."""
     if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*", table_name):
         raise ValueError(
             f"Невалидное имя таблицы: {table_name!r}. "
             "Ожидается формат 'schema.table'."
         )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Создание витрины
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def create_target_table(
-    pg_conn_id: str,
-    target_table: str,
-    **context,
-):
-    """
-    Создаёт витрину, если она ещё не существует.
-    """
-    _validate_table_name(target_table)
-
-    hook = PostgresHook(postgres_conn_id=pg_conn_id)
-
-    query = f"""
-        CREATE TABLE IF NOT EXISTS {target_table} (
-            id BIGINT NOT NULL,
-            score INTEGER NOT NULL,
-            inference_date DATE NOT NULL
-        )
-    """
-
-    logger.info("Проверяем наличие таблицы %s", target_table)
-    hook.run(query)
-    logger.info("Таблица %s готова к работе.", target_table)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -168,7 +135,6 @@ def extract_snapshot_to_s3(
 ):
     """
     Загружает в S3 только последний snapshot (за inference_date).
-
     Через XCom передаётся только ключ S3.
     """
     _validate_table_name(source_table)
@@ -200,8 +166,6 @@ def extract_snapshot_to_s3(
 
     key = f"{s3_prefix}/snapshot_{inference_date}.json"
 
-    # upload_json тянем здесь, чтобы не импортировать на уровне модуля
-    # (избегаем циклического импорта при возможных будущих правках)
     from scripts.s3_utils import upload_json
 
     upload_json(
@@ -217,7 +181,7 @@ def extract_snapshot_to_s3(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Запись предсказаний в витрину
+# Запись предсказаний в существующую витрину
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -227,11 +191,10 @@ def save_predictions_to_db(
     **context,
 ):
     """
-    Загружает результаты в витрину.
+    Загружает результаты в СУЩЕСТВУЮЩУЮ витрину.
 
-    Идемпотентность:
-      если в target_table уже есть строки за inference_date —
-      загрузка полностью пропускается.
+    Идемпотентность: если в target_table уже есть строки
+    за inference_date — загрузка пропускается.
     """
     _validate_table_name(target_table)
 
@@ -241,6 +204,10 @@ def save_predictions_to_db(
         task_ids="inference.run_inference",
         key="output_s3_key",
     )
+    inference_date = ti.xcom_pull(
+        task_ids="load_data.validate_source_data",
+        key="inference_date",
+    )
     s3_bucket = ti.xcom_pull(
         task_ids="inference.run_inference",
         key="s3_bucket",
@@ -249,19 +216,15 @@ def save_predictions_to_db(
         task_ids="inference.run_inference",
         key="s3_conn_id",
     )
-    inference_date = ti.xcom_pull(
-        task_ids="load_data.validate_source_data",
-        key="inference_date",
-    )
 
     if not output_s3_key:
         raise ValueError("Не найден S3-файл с результатами (output_s3_key).")
 
-    if not s3_bucket or not s3_conn_id:
-        raise ValueError("Не найдены параметры S3 (s3_bucket / s3_conn_id).")
-
     if not inference_date:
         raise ValueError("Не найдена дата инференса (inference_date).")
+
+    if not s3_bucket or not s3_conn_id:
+        raise ValueError("Не найдены параметры S3 (s3_bucket / s3_conn_id).")
 
     # 1. Скачиваем предсказания
     predictions = download_json(
@@ -312,7 +275,7 @@ def save_predictions_to_db(
             (int(row["id"]), int(row["score"]), inference_date) for row in predictions
         ]
 
-        # 5. Вставка батчами через execute_values
+        # 5. Батчевая вставка
         from psycopg2.extras import execute_values
 
         execute_values(
