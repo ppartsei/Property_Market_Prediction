@@ -2,6 +2,13 @@ DAG: smartscore_batch_inference
 Назначение:
 Батч-инференс модели CatBoost для предсказания высокого рейтинга объявлений. DAG читает snapshot данных из PostgreSQL, выгружает его в S3, выполняет предсказание и сохраняет результат обратно в БД — в таблицу public.SmartScore_predict.
 
+**Особенности:**
+- Модель — CatBoost (сохранена в S3 в формате `.pkl`).
+- `amenities` и `name` — текстовые признаки (`text_features`).
+- Предобработка использует статистики из train (`preprocess_stats.pkl`):
+медианы `bedrooms`/`beds` по `accommodates` и clip 99-го процентиля.
+- При повторном запуске за ту же дату данные не дублируются.
+
 Схема работы:
 
 check_model
@@ -46,7 +53,7 @@ check_model
 4. inference.run_inference
 Скачивает snapshot из S3, выполняет предобработку, загружает модель CatBoost, делает бинарное предсказание (0/1) по порогу threshold, сохраняет результат в JSON в S3.
 Функция: run_inference (scripts/inference.py)
-Параметры: бакет S3, ключ модели, выходной префикс (smartscore/output), порог (0.56), ID соединения S3.
+Параметры: бакет S3, ключ модели, выходной префикс (smartscore/output), порог (0.55), ID соединения S3.
 Результат: JSON-файл с предсказаниями в S3. Через XCom передаёт путь к файлу (output_s3_key), бакет (s3_bucket) и ID соединения (s3_conn_id).
 
 5. save_results.save_predictions
@@ -62,6 +69,7 @@ check_model
 |   Входные данные          | PostgreSQL, таблица `final_project.smartscore_test_snapshot` | Таблица БД |
 |   Модель                  | S3, ключ `catboost_model.pkl`                                | Pickle     |
 |   Промежуточный snapshot  | S3, префикс `smartscore/input`                               | JSON       |
+|   Статистики train        | S3, `smartscore/artifacts/preprocess_stats.pkl`              | Pickle     |
 |   Результат инференса     | S3, префикс `smartscore/output`                              | JSON       |
 
 
@@ -71,6 +79,7 @@ check_model
 | :------------------- | :--------- | :-------------------------------------------------------------- |
 | Модель CatBoost      | S3         | {S3_BUCKET}/catboost_model.pkl                                  |
 | Входной snapshot     | S3         | {S3_BUCKET}/smartscore/input/predictions_{inference_date}.json  |
+| Статистики train     | S3         | `{S3_BUCKET}/smartscore/artifacts/preprocess_stats.pkl`         |
 | Результат инференса  | S3         | {S3_BUCKET}/smartscore/output/predictions_{inference_date}.json |
 | Итоговые предсказания| PostgreSQL | public.SmartScore_predict (колонки: id, score, inference_date)  |
 
@@ -100,7 +109,7 @@ Airflow Variables:
 | smartscore_model_key    | Ключ модели в S3                   | catboost_model.pkl                     |
 | smartscore_input_prefix | Префикс входных данных в S3        | smartscore/input                       |
 | smartscore_output_prefix| Префикс результатов в S3           | smartscore/output                      |
-| smartscore_threshold    | Порог бинарной классификации       | 0.56                                   |
+| smartscore_threshold    | Порог бинарной классификации       | 0.55                                   |
 | smartscore_pg_conn_id   | ID соединения PostgreSQL в Airflow | postgres_smartscore                    |
 | smartscore_s3_conn_id   | ID соединения S3 в Airflow         | yandex_s3                              |
 
